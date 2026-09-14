@@ -1,0 +1,13 @@
+{
+  "name": "@live-codes/browser-elixir",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Client-side Elixir playground: runs Elixir in the browser via Popcorn (AtomVM compiled to WebAssembly).",
+  "license": "MIT",
+  "scripts": {
+    "start": "node serve.js",
+    "start:no-isolation": "node serve.js 8125 public --no-isolation",
+    "check": "node --check serve.js && node --check public/main.js"
+  }
+}
