@@ -7,7 +7,7 @@
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%236e4a7e'/><text x='8' y='12' font-size='9' font-family='monospace' text-anchor='middle' fill='white'>ex</text></svg>"
     />
-    <title>Elixir in the browser (AtomVM + WASM)</title>
+    <title>Elixir &amp; Erlang in the browser (AtomVM + WASM)</title>
     <style>
       :root {
         color-scheme: dark;
@@ -156,17 +156,25 @@
         padding: 1px 4px;
       }
       footer {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px 18px;
+        flex-wrap: wrap;
         padding: 7px 14px;
         border-top: 1px solid var(--border);
         font-size: 11px;
         color: var(--dim);
       }
       footer code { color: #a8b0bd; }
+      .runtime { text-align: right; margin-left: auto; }
+      .runtime code { word-break: break-all; }
     </style>
   </head>
   <body>
     <header>
-      <h1>Elixir <span>&rarr;</span> WebAssembly, client-side</h1>
+      <h1>Elixir <span>&amp;</span> Erlang <span>&rarr;</span> WebAssembly, client-side</h1>
+      <select id="language" aria-label="Language"></select>
       <select id="examples" aria-label="Load an example"></select>
       <div class="grow"></div>
       <span id="status" class="badge busy">booting…</span>
@@ -178,13 +186,13 @@
     <div id="progress">
       <span id="progress-text">Booting the BEAM…</span>
       <span class="track"></span>
-      <span class="hint">first load downloads ~8 MB from this origin; later loads come from cache</span>
+      <span class="hint">first load downloads ~8 MB from the runtime mirror; later loads come from cache</span>
     </div>
 
     <main>
       <section>
         <div class="pane-head">
-          main.exs
+          <span id="filename">main.exs</span>
           <span class="hint"><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Enter</kbd> to run</span>
         </div>
         <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
@@ -199,9 +207,8 @@
     </main>
 
     <footer>
-      The Elixir compiler itself runs in <code>WebAssembly</code> — your code is evaluated in this
-      tab and never uploaded. Elixir is <em>evaluated</em>, not run as a script: the last
-      expression's value is returned, so <code>IO.gets</code> has no input to read.
+      <span id="footer-note"></span>
+      <span class="hint runtime">runtime: <code id="runtime-url"></code> <span id="runtime-override"></span></span>
     </footer>
 
     <script type="module" src="./main.js"></script>

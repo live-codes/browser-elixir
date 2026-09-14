@@ -1,5 +1,3 @@
-import init from "./AtomVM.mjs";
-
 const MESSAGES = {
   INIT: "popcorn-init",
   START_VM: "popcorn-startVm",
@@ -15,6 +13,12 @@ const MESSAGES = {
 const HEARTBEAT_INTERVAL_MS = 500;
 
 let Module = null;
+let init = null;
+let binaryDir = "";
+let workerScript = "";
+
+// The binaries sit next to the bundle, which may be a CDN mirror.
+const locateBinary = (path) => binaryDir + path;
 
 class TrackedValue {
   constructor({ key, value }) {
@@ -30,6 +34,35 @@ globalThis.TrackedValue = TrackedValue;
 
 export async function runIFrame() {
   const bundlePath = document.querySelector('meta[name="bundle-path"]').content;
+  binaryDir = new URL(".", bundlePath).href;
+
+  // Emscripten spawns its pthread workers from the runtime module's own URL —
+  // `new Worker(new URL("AtomVM.mjs", import.meta.url), { type: "module" })` —
+  // and a worker script must be same-origin, which would pin the runtime to this
+  // origin. It accepts `mainScriptUrlOrBlob` as an override, so the module is
+  // fetched from the mirror and handed back as a Blob URL: same-origin, and with
+  // a usable base URL.
+  //
+  // A Blob rather than a `data:` URL: these are *module* workers (Emscripten
+  // hardcodes that, so `importScripts` is unavailable and the script has to be
+  // the module itself), and a module worker created from a data: URL starts and
+  // then aborts with an empty reason — see FINDINGS.md.
+  //
+  // This is also the step where a misconfigured mirror shows up, and an iframe
+  // that dies silently is near-impossible to debug, so failures are reported to
+  // the parent's output pane.
+  try {
+    const source = await fetch(binaryDir + "AtomVM.mjs").then((resp) => resp.text());
+    workerScript = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    ({ default: init } = await import(binaryDir + "AtomVM.mjs"));
+  } catch (error) {
+    send(
+      MESSAGES.STDERR,
+      `Runtime load failed: ${(error && (error.stack || error.message)) || error}\n`,
+    );
+    throw error;
+  }
+
   const bundleBuffer = await fetch(bundlePath).then((resp) =>
     resp.arrayBuffer(),
   );
@@ -59,6 +92,8 @@ async function startVm(avmBundle) {
     resolveResultPromise = resolve;
   });
   Module = await init({
+    mainScriptUrlOrBlob: workerScript,
+    locateFile: locateBinary,
     preRun: [
       function ({ FS }) {
         FS.mkdir("/data");

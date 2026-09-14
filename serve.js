@@ -59,10 +59,12 @@ const server = createServer(async (req, res) => {
   const headers = {
     'Content-Type': TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
     'Content-Length': body.length,
-    // The wasm runtime and the Elixir bundle are content-pinned and ~8 MB, so
-    // they are worth caching hard: Popcorn recreates its iframe on every boot
-    // (and on every heartbeat reload), and those re-fetches must not hit the wire.
-    'Cache-Control': rel.startsWith('wasm/') ? 'public, max-age=31536000, immutable' : 'no-store',
+    // The binaries are content-pinned, so they cache hard. Everything else is
+    // served fresh: caching the runtime *scripts* hard once cost an hour,
+    // because a stale `popcorn.js` silently kept the unpatched bundle path.
+    'Cache-Control': /\.(wasm|avm)$/.test(rel)
+      ? 'public, max-age=31536000, immutable'
+      : 'no-store',
   };
 
   if (!noIsolation) {
@@ -81,6 +83,6 @@ server.listen(PORT, () => {
   if (noIsolation) {
     console.log('note: the AtomVM runtime may refuse to boot without COOP/COEP');
   }
-  console.log('first load downloads ~8 MB from this origin; later loads come from cache');
+  console.log('the runtime comes from the runtime mirror (see ?baseUrl=); ~8 MB on first load');
   console.log('press Ctrl+C to stop');
 });

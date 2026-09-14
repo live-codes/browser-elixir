@@ -1,3 +1,14 @@
+/*
+ * Popcorn 0.3 runtime, vendored with exactly ONE local change.
+ *
+ * Upstream builds the iframe's bundle path as `"../" + bundlePath`, which pins
+ * the bundle to the hosting origin: an absolute URL (e.g. a jsDelivr mirror)
+ * survives as `../https://…` and resolves to `<origin>/https://…`. Dropping the
+ * prefix lets `bundlePath` be absolute or mirror-relative, which is what makes
+ * loading the runtime from a CDN possible. See WASM.md.
+ *
+ * Everything else is upstream, unmodified, and byte-comparable apart from this.
+ */
 const INIT_VM_TIMEOUT_MS = 30_000;
 const CALL_TIMEOUT_MS = 60_000;
 const HEARTBEAT_TIMEOUT_MS = 60_000;
@@ -120,16 +131,17 @@ export class Popcorn {
     this._trace("Main: mount, container: ", container);
 
     this._iframe = document.createElement("iframe");
+    // The iframe-side script stays with this file: it is patched, and it loads
+    // the runtime addressed by the bundle path, which may be a mirror.
+    const iframeDir = new URL("./", import.meta.url).href;
     this._iframe.srcdoc = `<html>
       <html lang="en" dir="ltr">
           <head>
-            <meta name="bundle-path" content="${"../" + this._bundlePath}" />
+            <meta name="bundle-path" content="${this._bundlePath}" />
           </head>
-          <script type="module" src="${this._wasmDir + "popcorn.js"}" defer></script>
-          <script type="module" src="${this._wasmDir + "AtomVM.mjs"}" defer></script>
-          <script type="module" src="${this._wasmDir + "popcorn_iframe.js"}" defer></script>
+          <script type="module" src="${iframeDir}popcorn_iframe.js" defer></script>
           <script type="module" defer>
-            import { runIFrame } from "${this._wasmDir + "popcorn_iframe.js"}";
+            import { runIFrame } from "${iframeDir}popcorn_iframe.js";
             runIFrame();
           </script>
       </html>`;

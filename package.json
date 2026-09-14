@@ -8,6 +8,6 @@
   "scripts": {
     "start": "node serve.js",
     "start:no-isolation": "node serve.js 8125 public --no-isolation",
-    "check": "node --check serve.js && node --check public/main.js"
+    "check": "node --check serve.js && node --check public/main.js && node --check public/wasm/popcorn.js && node --check public/wasm/popcorn_iframe.js"
   }
 }

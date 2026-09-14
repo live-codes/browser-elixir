@@ -1,10 +1,10 @@
-# Spike findings — Elixir in the browser
+# Spike findings — Elixir and Erlang in the browser
 
-**Status: spike complete.** The page boots AtomVM, evaluates arbitrary Elixir, streams
-`stdout`/`stderr`, reports `inspect/1` of the result, and recovers when the VM aborts. Everything
-below was **run**, in headless Chrome, against the vendored bundle — not inferred from docs.
+**Status: spike complete.** The page boots AtomVM from a mirrored runtime, evaluates Elixir and
+Erlang, streams `stdout`/`stderr`, reports `inspect/1` of the result, and recovers when the VM
+aborts. Everything below was **run**, in headless Chrome — not inferred from docs.
 
-Artifacts under test: `public/wasm/` (hashes in [public/wasm/VERSION.md](public/wasm/VERSION.md)).
+Runtime provenance, the mirror pin and the hashes are in [WASM.md](WASM.md).
 
 ## 1. The trap: the runtime and the bundle are version-locked
 
@@ -14,17 +14,15 @@ from the same build. This cost the most time to establish, so it is recorded fir
 - The bundle here speaks the older handshake: the parent sends `popcorn-init` / `popcorn-startVm`,
   and Elixir calls `Popcorn.Wasm.register/1`, which lands in the iframe as `Module.onElixirReady`.
   Stack traces from this bundle show `Elixir.Popcorn.Wasm.handle_message!/2` and
-  `Elixir.EvalInWasm.handle_wasm/2` — i.e. a 0.3-era API, not the current one.
+  `Elixir.EvalInWasm.handle_wasm/2` — a 0.3-era API, not the current one.
 - Every published `@swmansion/popcorn` (checked **0.2.2, 0.3.0, 0.3.3**) ships a refactored
   runtime instead: `dist/iframe.mjs` + `dist/popcorn.mjs`, a **4.1–4.2 MB debug `AtomVM.wasm`**,
   and a `Popcorn.Wasm.ready/0,1` + `set_default_receiver/1` handshake over a `popcorn-event`
   channel. The 0.3.3 `iframe.mjs` never sends `popcorn-init`, and waits for a `ready/0` this
   bundle never calls — so `Popcorn.init()` would hang until its 30 s timeout.
 
-Hence: **vendor a matched set, or rebuild the bundle to match the runtime you pin.** Do not mix a
-CDN runtime with this bundle. The clean fix is to cook our own `bundle.avm` against
-`@swmansion/popcorn@0.3.3` (Docker + `mise install` + `mix popcorn.cook`), after which the runtime
-can be served from jsDelivr.
+Hence: **keep a matched set, or rebuild the bundle to match the runtime you pin.** This also means a
+mirror serves *binaries only* — the scripts are pinned in-repo so the halves cannot drift apart.
 
 ## 2. The reply shape is not the documented one
 
@@ -43,53 +41,87 @@ raw `onCall` traces from the page console:
 A driver that assumes `data.value` throws `Cannot use 'in' operator …` on every success. `data` is
 already a string.
 
-## 3. Verified working
+## 3. Verified working — Elixir
 
 Run in the browser, one after another, against a single booted instance.
 
 | snippet | result | time |
 | --- | --- | --- |
-| `IO.puts("Hello from Elixir!")` | stdout `Hello from Elixir!`; value `:ok` | 7 ms |
-| `1..10 \|> Enum.filter(&(rem(&1, 2) == 0)) \|> Enum.map(&(&1 * &1)) \|> Enum.sum()` | `220` | 9 ms |
-| `people \|> Enum.sort_by(& &1.born) \|> Enum.map_join(", ", &"#{&1.name} (#{&1.born})")` | `"Ada (1815), Grace (1906), Alan (1912)"` | 25 ms |
-| `defmodule Fib do … end` then `Fib.of(20)` | `6765` | 361 ms |
-| `for x <- 1..6, y <- 1..6, x + y == 7, do: {x, y}` | `{6, [{1, 6}, {2, 5}, {3, 4}, {4, 3}, {5, 2}, {6, 1}]}` | 25 ms |
-| `1 + 2 * 3` | `7` | 2 ms |
-| `1.5 + 1.5`, `7 / 2` | `3.0`, `3.5` | 3 ms |
-| `Enum.map([1, 2, 3], &(&1 * 2))` | `[2, 4, 6]` | 4 ms |
-| `Enum.chunk_every([1, 2, 3, 4, 5], 2)` | `[[1, 2], [3, 4], [5]]` | 4 ms |
-| `String.upcase("hello") <> "!"` | `"HELLO!"` | 4 ms |
-| `Map.new([{:a, 1}, {:b, 2}])` | `%{a: 1, b: 2}` | 6 ms |
+| `IO.puts("Hello from Elixir!")` | stdout `Hello from Elixir!`; value `:ok` | 6 ms |
+| `1..10 \|> Enum.filter(&(rem(&1, 2) == 0)) \|> Enum.map(&(&1 * &1)) \|> Enum.sum()` | `220` | 13 ms |
+| `people \|> Enum.sort_by(& &1.born) \|> Enum.map_join(", ", &"#{&1.name} (#{&1.born})")` | `"Ada (1815), Grace (1906), Alan (1912)"` | 23 ms |
+| `defmodule Fib do … end` then `Fib.of(20)` | `6765` | 352 ms |
+| `for x <- 1..6, y <- 1..6, x + y == 7, do: {x, y}` | `{6, [{1, 6}, {2, 5}, {3, 4}, {4, 3}, {5, 2}, {6, 1}]}` | 23 ms |
+| `try do raise "boom" rescue e -> {:caught, Exception.message(e)} end` | `{:caught, "boom"}` | 8 ms |
+| `1 + 2 * 3`, `1.5 + 1.5`, `7 / 2` | `7`, `3.0`, `3.5` | 2–3 ms |
+| `Enum.map([1, 2, 3], &(&1 * 2))`, `Enum.chunk_every([1, 2, 3, 4, 5], 2)` | `[2, 4, 6]`, `[[1, 2], [3, 4], [5]]` | 4 ms |
+| `String.upcase("hello") <> "!"`, `Map.new([{:a, 1}, {:b, 2}])` | `"HELLO!"`, `%{a: 1, b: 2}` | 4–6 ms |
 | `IO.inspect([1, 2, 3])` | stdout `[1, 2, 3]`; value `[1, 2, 3]` | 3 ms |
 | `spawn(fn -> send(parent, :ping) end)` + `receive` | `:ping` | 7 ms |
 | `:ets.new(:t, [])` | `#Reference<0.0.95>` | 4 ms |
 | `:crypto.hash(:sha256, "abc")` | `<<186, 120, 22, 191, …>>` — byte-for-byte `sha256("abc")` | 3 ms |
-| `try do raise "boom" rescue e -> Exception.message(e) end` | `"boom"` | 8 ms |
 
-`Fib.of(20)` at 361 ms is the naive double recursion being interpreted — ~40× a typical
-`Enum` call. Worth knowing for anything compute-shaped.
+`Fib.of(20)` at ~350 ms is the naive double recursion being interpreted — ~25× a typical `Enum`
+call. Worth knowing for anything compute-shaped.
 
-## 4. Capability matrix — what a user will hit
+## 4. Verified working — Erlang
 
-| probe | outcome |
-| --- | --- |
-| `Regex.match?(~r(ab), ~s(xabc))` | **VM abort.** `Nif not found` → `binary:list_to_bin/1` → crash dump → `Aborted()` |
-| `DateTime.utc_now()` | **VM abort.** `Nif not found` → `os:system_time/0` |
-| `Task.async(fn -> 42 end) \|> Task.await()` | **VM abort.** `Nif not found` → `erlang:monitor/3` |
-| `Float.round(1.25, 1)` | **VM abort, silently** — no reply and no diagnostic at all |
-| `defmodule P do defstruct [:name] end` + `%P{name: "Ada"}` | **VM abort.** Compile error on stderr: `EvalInWasm.P.__struct__/1 is undefined, cannot expand struct EvalInWasm.P` |
-| a syntax error | **VM abort** |
-| an uncaught `raise` | **VM abort** |
+The eval app registers **three** actions, not one: `eval_elixir`, `eval_erlang`, and
+`eval_erlang_module`. All three exist in this bundle, and the flag for which one to send is the
+caller's: upstream sniffs a leading `-module(`.
 
-Two patterns explain all of it: **a missing NIF is a hard abort**, and **a compile-time failure
-happens before any `try` in the evaluated string can run**. Notably, `defmodule` works for
-*function calls* (`Fib.of(20)`) but not for *struct literals* in the same eval — because
-`Code.eval_string/3` is called with the host module's `__ENV__`, so `defmodule P` really defines
-`EvalInWasm.P`.
+| snippet (`eval_erlang`) | result | time |
+| --- | --- | --- |
+| `1 + 1.` | `2` | 3 ms |
+| `lists:sum([1, 2, 3, 4]).` | `10` | 3 ms |
+| `lists:sort([3, 1, 2]).`, `length([a, b, c]).` | `[1, 2, 3]`, `3` | 3 ms |
+| `element(2, {a, b, c}).` | `:b` | 5 ms |
+| `maps:get(k, #{k => 42}).` | `42` | 3 ms |
+| `Fun = fun(X) -> X * X end, Fun(7).` | `49` | 4 ms |
+| `lists:foldl(fun(X, Acc) -> X + Acc end, 0, [1, 2, 3, 4, 5]).` | `15` | 5 ms |
+| `self().`, `spawn(fun() -> 1 end).` | `#PID<0.25.0>`, `#PID<0.26.0>` | 3 ms |
+| `try 1 / 0 catch error:Reason -> Reason end.` | `:badarith` | 4 ms |
 
-## 5. How errors behave (and how to make them bearable)
+**Module compilation works too** — so the Erlang compiler (`:compile`) is in the bundle, not just
+Elixir's. These ran through the page itself (`eval_erlang_module`, then `eval_erlang` in the same
+session):
 
-An uncaught error is **not** reported as an error. The sequence, from the page console:
+| snippet | result | time |
+| --- | --- | --- |
+| `-module(m). -export([double/1]). double(X) -> X * 2.` | `:m` | 42 ms |
+| `m:double(21).` | `42` | 1 ms |
+| `[{X, Y} \|\| X <- lists:seq(1, 6), Y <- lists:seq(1, 6), X + Y =:= 7].` | the six pairs | 7 ms |
+| `lists:sum(lists:map(fun(X) -> X * X end, lists:seq(1, 10))).` | `385` | 10 ms |
+| `M0 = #{a => 1}, M1 = maps:put(b, 2, M0), maps:to_list(M1).` | `[a: 1, b: 2]` | 3 ms |
+| `Parent = self(), spawn(…), receive {_From, Result} -> Result end.` | `42` | 7 ms |
+
+Compiled modules persist for the session (`:code.load_binary`) and survive a language switch — so
+`m:double(21).` works after you have run the module example once. That is also why the examples
+ship as a pair: define, then call.
+
+**Two Erlang-specific quirks, both found by running the examples:**
+
+1. **A comment on the module's first line breaks compilation.** This snippet fails:
+   ```erlang
+   %% a comment
+   -module(m).
+   -export([double/1]).
+   ```
+   with `{:error, {3, :erl_parse, ['syntax error before: ', '-']}}` — the error points at
+   `-export`, the second form. The same comment after `-module(m).` compiles fine. The bundle's
+   `split_forms` chunks tokens on `{:dot, _}` before handing each chunk to `:erl_parse.parse_form`,
+   and a comment preceding the first attribute apparently lands in the wrong chunk. Workaround:
+   keep comments off the first line.
+
+2. **Erlang parse errors are values, not crashes** — see §5.
+
+Results are formatted with Elixir's `inspect/1` either way, because the eval server is an Elixir
+GenServer — hence `:b`, `[a: 1, b: 2]` and `:badarith` rather than `b`, `[{a,1},{b,2}]`,
+`badarith`.
+
+## 5. How errors behave — and the Elixir/Erlang asymmetry
+
+An uncaught Elixir error is **not** reported as an error. The sequence, from the page console:
 
 ```
 [debug] Main: call:  {requestId: 7, …}
@@ -99,21 +131,27 @@ An uncaught error is **not** reported as an error. The sequence, from the page c
 [debug] Main: reloading iframe → deinit → mount
 ```
 
-So the call is acknowledged and then never answered — the client waits out its timeout (set to
-15 s here, 30 s by default). The *next* call is what discovers the corpse: it gets `noproc`, which
-triggers an iframe reload, and that reload cancels the pending call with
+The call is acknowledged and then never answered, so the client waits out its timeout (15 s here,
+30 s by default). The *next* call is what discovers the corpse: it gets `noproc`, which triggers an
+iframe reload, and that reload cancels the pending call with
 `Call cancelled due to instance deinit`. **One run is lost to the reload**, which is why
-`public/main.js` restarts the VM itself as soon as a call times out. Verified: after the error
-demo, the next run returned `220` in 10 ms.
+`public/main.js` restarts the VM itself as soon as a call times out — verified: after the error
+example, the next run returned `220` in 10 ms.
 
-**`try`/`rescue` works**, verified three ways — `raise` → `"boom"`; `div(1, 0)` →
+Erlang behaves differently, and better: `:erl_scan`/`:erl_parse` failures are returned as ordinary
+values. `lists:sum([1, 2, 3, 4])` with no final dot yields
+`{:error, {1, :erl_parse, ['syntax error before: ', []]}}` in 3 ms — status `done`, no restart.
+
+**`try`/`rescue` works** (Elixir), verified four ways — `raise` → `"boom"`; `div(1, 0)` →
 `"bad argument in arithmetic expression"`; `Foo.bar()` →
 `"function :elixir.eval_external_handler/3 is undefined or private"` (AtomVM naming an internal,
-which is a diagnostics-quality datapoint in itself).
+which is a diagnostics-quality datapoint in itself); and Erlang's `try … catch error:Reason`.
 
-That suggests a driver-level improvement worth making during LiveCodes integration: wrap the
-user's source so ordinary runtime errors come back as a value instead of a 15 s hang and a
-restart.
+What cannot be caught in either language: **compile errors and missing NIFs**. They abort the VM
+below the `try`.
+
+A driver-level improvement worth making during LiveCodes integration is to wrap Elixir source so
+ordinary runtime errors come back as a value instead of a 15 s hang and a restart:
 
 ```elixir
 try do
@@ -123,11 +161,56 @@ rescue
 end
 ```
 
-It will **not** rescue compile errors or missing NIFs — those abort the VM before or below the
-`try` — so the timeout-and-restart path has to stay regardless. It was deliberately left out of
-the PoC so the raw behaviour remains visible.
+It will not rescue compile errors or missing NIFs, so the timeout-and-restart path has to stay. It
+was left out of the PoC so the raw behaviour remains visible.
 
-## 6. Cross-origin isolation is mandatory (measured, both ways)
+## 6. Capability matrix — what a user will hit
+
+| probe | outcome |
+| --- | --- |
+| `Regex.match?(~r(ab), ~s(xabc))` | **VM abort.** `Nif not found` → `binary:list_to_bin/1` → crash dump → `Aborted()` |
+| `DateTime.utc_now()` | **VM abort.** `Nif not found` → `os:system_time/0` |
+| `Task.async(fn -> 42 end) \|> Task.await()` | **VM abort.** `Nif not found` → `erlang:monitor/3` |
+| `Float.round(1.25, 1)` | **VM abort, silently** — no reply and no diagnostic at all |
+| `defmodule P do defstruct [:name] end` + `%P{name: "Ada"}` | **VM abort.** Compile error on stderr: `EvalInWasm.P.__struct__/1 is undefined, cannot expand struct EvalInWasm.P` |
+| a syntax error, or an uncaught `raise` | **VM abort** |
+| Erlang module with a leading `%%` comment | error tuple (not fatal) — see §4 |
+
+Two patterns explain the fatal ones: **a missing NIF is a hard abort**, and **a compile-time failure
+happens before any `try` in the evaluated string can run**. Notably, `defmodule` works for *function
+calls* (`Fib.of(20)`) but not for *struct literals* in the same eval — because
+`Code.eval_string/3` is called with the host module's `__ENV__`, so `defmodule P` really defines
+`EvalInWasm.P`.
+
+### The 16 MiB heap ceiling (most likely cause of the `memory access out of bounds`)
+
+The build allocates its shared memory with `initial === maximum`:
+
+```js
+var INITIAL_MEMORY = Module["INITIAL_MEMORY"] || 16777216;   // 16 MiB
+wasmMemory = new WebAssembly.Memory({
+  initial: INITIAL_MEMORY / 65536,
+  maximum: INITIAL_MEMORY / 65536,
+  shared: true,
+});
+```
+
+so the heap is fixed at 16 MiB and can never grow. A 7 MB bundle, the Elixir/Erlang compilers and
+every module a session defines all share it — and exceeding it surfaces as
+`memory access out of bounds` inside a pthread worker.
+
+It cannot be raised from JavaScript. Passing `INITIAL_MEMORY: 256 * 1024 * 1024` fails at
+instantiation, because the limit is baked into the compiled module as well:
+
+```
+wasm streaming compile failed: LinkError: WebAssembly.instantiate(): Import #96 "a" "a": …
+```
+
+Lifting it needs a rebuilt AtomVM (a larger initial memory, or memory growth enabled) — not a
+configuration change. Until then the practical mitigations are the ones already in the driver: the
+VM aborts cleanly and is restarted, and a run that dies is not silently ignored.
+
+## 7. Cross-origin isolation is mandatory (measured, both ways)
 
 Served the identical page with and without COOP/COEP:
 
@@ -141,56 +224,117 @@ Upstream's `_headers` is right, and the Emscripten build's conditional
 degradation in practice. `boot()` in `public/main.js` now names this cause explicitly, because the
 symptom is a bare timeout.
 
-## 7. Boot cost and payload
+## 8. Hosting the runtime on a CDN
+
+The runtime is fully mirrored. What made that hard was the pthread worker: Emscripten spawns it
+from the runtime module's own URL.
+
+```js
+allocateUnusedWorker() {
+  if (Module["mainScriptUrlOrBlob"]) { … new Worker(pthreadMainJs, {type:"module", name:"em-pthread"}) }
+  else worker = new Worker(new URL("AtomVM.mjs", import.meta.url), {type:"module", name:"em-pthread"});
+}
+```
+
+This build uses **pthreads** — which is exactly why it needs `SharedArrayBuffer`, and therefore why
+cross-origin isolation is mandatory (§7). Those threads are workers, and workers must be
+same-origin, so a cross-origin `AtomVM.mjs` throws a `SecurityError` that is swallowed. Measured
+with the same page, the same bundle and the same headers, varying only the script origin:
+
+| script origin | outcome |
+| --- | --- |
+| same-origin | boots in 176 ms; bundle still fetched from jsDelivr |
+| jsDelivr | `INIT` fires, then nothing — boot times out after 30 s, no error logged |
+
+The worker traffic is visible in the network log as repeated `GET /wasm/AtomVM.mjs (Script)`
+requests after boot: that is the em-pthread pool spawning from the module's own URL.
+
+Emscripten's `Module.mainScriptUrlOrBlob` lifts the constraint: fetch the module from the mirror and
+hand it back as a **Blob URL**, which is same-origin and has a usable base URL. That is what
+`popcorn_iframe.js` does now, so `AtomVM.mjs` is mirrored too and the repo ships only the two
+patched scripts (~20 KB).
+
+Two things this cost, both worth recording:
+
+- **It has to be the module itself.** The worker is created with `{ type: "module" }` (hardcoded by
+  Emscripten), and `importScripts` does not exist in a module worker — so the usual
+  `toDataUrl('importScripts("…")')` helper, which is for *classic* workers, cannot be used here.
+- **Blob, not `data:`.** Tested both against the real module: `import(dataUrl)` and
+  `new Worker(dataUrl, {type:'module'})` each work in isolation in the top frame, but a data-URL
+  worker running the *runtime* starts and then aborts with an empty reason:
+
+  ```
+  Aborted()
+  worker sent an error! Uncaught RuntimeError: Aborted(). Build with -sASSERTIONS for more info.
+  ```
+
+  A Blob URL boots in ~350 ms. The reading: a `data:` URL has no origin and no hierarchical base, so
+  `scriptDirectory` is unresolvable inside the worker, whereas `blob:http://…` is same-origin.
+  (That error string is also why the data-URL experiment was so opaque at first: the whole data URL
+  is echoed as the worker's `filename`, so the actual message sits ~200 KB into the line.)
+
+**A caching lesson paid for in debugging time:** `serve.js` originally marked all of `/wasm/*`
+`immutable` for a year. A stale cached `popcorn.js` silently kept the *unpatched* bundle path, and
+the failure looked like a CDN problem (`GET /https://cdn.jsdelivr.net/…/bundle.avm 404`). Only
+pinned binaries are cached hard now; scripts are `no-store`.
+
+## 9. Boot cost and payload
 
 | | |
 | --- | --- |
-| `AtomVM.wasm` | 997,332 B |
-| `bundle.avm` (contains the Elixir compiler) | 7,114,092 B |
-| `AtomVM.mjs` + `popcorn.js` + `popcorn_iframe.js` | 168,818 B |
-| **total** | **~8.3 MB** |
-| boot (localhost, warm cache) | 116–227 ms |
+| `bundle.avm` — mirror | 7,114,092 B |
+| `AtomVM.wasm` — mirror | 997,332 B |
+| `AtomVM.mjs` — mirror | 149,754 B |
+| patched scripts in this repo (`popcorn.js`, `popcorn_iframe.js`) | 20,543 B |
+| **runtime total** | **~8.3 MB, of which 20 KB is committed** |
+| boot, binaries warm | 116–348 ms |
+| boot, binaries cold from jsDelivr | 1,163 ms |
 
-Measured on loopback, so the 8.3 MB is not represented in those timings — on a real network the
-download dominates. `serve.js` marks `/wasm/*` `immutable` for a year, which matters because
-Popcorn recreates its iframe on every boot and on every heartbeat reload.
+Everything except the two scripts is fetched from the mirror once and cached; the scripts ship with
+the page. Boot times are measured on loopback, so a cold network fetch of 8.1 MB is not represented.
 
-## 8. Recommendation for LiveCodes
+## 10. Recommendation for LiveCodes
 
-- **`lang-elixir.ts`**: identity compiler factory; `scripts: [baseUrl + '{{hash:lang-elixir-script.js}}']`;
-  `scriptType: 'text/elixir'`; `compiledCodeLanguage: 'elixir'`; `largeDownload: true`. The result
-  page becomes the parent of Popcorn's iframe, which is the model this PoC already uses.
-- **The isolation requirement is the blocker to resolve first.** Popcorn's iframe is created
-  *inside* the result iframe, so the top-level document's response headers decide whether
+- **`lang-elixir` / `lang-erlang`**: identity compiler factory;
+  `scripts: [baseUrl + '{{hash:lang-elixir-script.js}}']`; `scriptType: 'text/elixir'` (and
+  `'text/erlang'`); `compiledCodeLanguage: 'elixir'` / `'erlang'`; `largeDownload: true`. The result
+  page becomes the parent of Popcorn's iframe, which is the model this PoC already uses. Both
+  languages share one VM, so they can share one runtime.
+- **Two blockers to settle first.** (1) The isolation requirement: Popcorn's iframe is created
+  *inside* the result iframe, so the top-level document's headers decide whether
   `SharedArrayBuffer` exists — and when LiveCodes is embedded via CDN those headers are not ours.
-  Either the result page must be served cross-origin isolated, or the runtime needs an AtomVM
-  build without the pthread path. Popcorn 0.4 requires the same headers, so this outlives 0.3.
-- **Hosting**: the matched set belongs in `browser-compilers` (or an npm package) and referenced
-  from `vendors.ts`, rather than vendored into the language directory.
+  (2) The same-origin script constraint from §8, which rules out the usual "put it on jsDelivr"
+  hosting for `AtomVM.mjs`. Either the result page is served cross-origin isolated with the scripts
+  same-origin, or the runtime needs an AtomVM build without the pthread path. Popcorn 0.4 requires
+  the same headers, so this outlives 0.3.
+- **Hosting**: the two binaries belong in `browser-compilers` (or an npm package) and referenced
+  from `vendors.ts`; the three scripts belong with the language module.
 - **Contract mapping**: stdout/stderr come from `onStdout`/`onStderr`; the inspected value is the
   result; `exitCode` is ours to define (`0` on success, `1` on abort/timeout), and the timeout is
   load-bearing rather than exceptional.
-- **No stdin**, so the language is eval-shaped: no competitive-programming-style input.
+- **No stdin**, so both languages are eval-shaped: no competitive-programming-style input.
 
-## 9. Provenance notes
+## 11. Provenance notes
 
 Diagnostics from the bundle leak its build machine:
 `/Users/yamauchi/repos/popcorn/examples/eval_in_wasm/lib/eval_in_wasm.ex`. Combined with the
-`Popcorn.Wasm` / `handle_wasm/2` API shape, that dates the bundle to a 0.3-era checkout of
-Popcorn's own eval example — consistent with it being a redistribution of that example's output.
-Provenance and the rebuild path are in [public/wasm/VERSION.md](public/wasm/VERSION.md).
+`Popcorn.Wasm` / `handle_wasm/2` API shape, that dates the bundle to a 0.3-era checkout of Popcorn's
+own eval example — consistent with it being a redistribution of that example's output, built with
+OTP 26.0.2 / Elixir 1.17.3. Provenance, the mirror pin and the hashes are in
+[WASM.md](WASM.md).
 
-## 10. Reproducing the verification
+## 12. Reproducing the verification
 
 ```bash
-npm start                 # → http://localhost:8125/
-npm run check             # syntax-check serve.js and public/main.js
-npm run start:no-isolation  # then reload → boot fails; proves §6
+npm start                     # → http://localhost:8125/
+npm run check                 # syntax-check serve.js, public/main.js and the patched scripts
+npm run start:no-isolation    # then reload → boot fails; proves §7
 ```
 
-Driven here with the `agent-browser` CLI against headless Chrome: select each example, click
-Run, and read `document.documentElement.dataset.status` (`booting` / `ready` / `running` / `done`
-/ `error` / `failed`) plus the `#result` and `#logs` panes. One Windows-specific gotcha, recorded
-because it cost real time: PowerShell 5.1 strips embedded double quotes from native-command
-arguments, so `eval` scripts must avoid string literals entirely — the page's element ids are
-exposed as globals (`result`, `logs`, `editor`, `examples`), which is what the probes used.
+Driven here with the `agent-browser` CLI against headless Chrome: select the language and example,
+click Run, and read `document.documentElement.dataset.status` (`booting` / `ready` / `running` /
+`done` / `error` / `failed`), `dataset.language`, `dataset.bootMs` and `dataset.runs`, plus the
+`#result` and `#logs` panes. One Windows-specific gotcha, recorded because it cost real time:
+PowerShell 5.1 strips embedded double quotes from native-command arguments, so `eval` scripts must
+avoid string literals entirely — the page's element ids are exposed as globals (`result`, `logs`,
+`editor`, `examples`, `run`), which is what the probes used.
