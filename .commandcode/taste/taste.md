@@ -8,3 +8,4 @@
 
 - Favors solutions that run entirely client-side in the browser with no server or backend required. Confidence: 0.5
 - Prefers large binaries/assets to be loaded from a GitHub-mirroring CDN (e.g. jsDelivr) rather than committed into the repo, with a configurable `baseUrl` so a different mirror can be pointed at. Confidence: 0.8
+- Prefers to minimize special hosting/server requirements: when a solution depends on server-side constraints (e.g. cross-origin isolation headers), asks whether they can be avoided so it works on arbitrary hosts. Confidence: 0.5

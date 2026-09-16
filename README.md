@@ -85,11 +85,16 @@ Behaviour worth knowing before you trust a snippet:
 ## Limitations
 
 - **Cross-origin isolation is mandatory.** The page must be served with
-  `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`.
-  Verified both ways: without them `SharedArrayBuffer` is `undefined`, `crossOriginIsolated` is
-  `false`, and `Popcorn.init()` never returns. `serve.js` sets both; `--no-isolation` exists so this
-  can be demonstrated. **This is the main open question for LiveCodes embedding**, where the
-  top-level document's headers are not ours to choose.
+  `Cross-Origin-Opener-Policy: same-origin` plus `Cross-Origin-Embedder-Policy`. Verified three ways:
+  `require-corp` and `credentialless` both isolate the document and boot; without either,
+  `crossOriginIsolated` is `false`, `SharedArrayBuffer` is `undefined`, and `Popcorn.init()` never
+  returns. `serve.js` defaults to `require-corp`; `npm run start:credentialless` switches to
+  `credentialless`, which is the safer choice if you point `?baseUrl=` at a mirror that does not
+  send CORP headers (jsDelivr does). **This remains the main open question for LiveCodes
+  embedding**, where the top-level document's headers are not ours to choose. It also cannot be
+  worked around at runtime: with the headers absent the VM never becomes ready at all, and
+  recovering `SharedArrayBuffer` by hand only moves the failure into the pthread worker — lifting
+  the requirement means a different runtime build ([FINDINGS.md](FINDINGS.md) §7).
 - **An uncaught Elixir error costs a restart.** It is indistinguishable from a slow program, so the
   UI waits out a 15 s timeout and then restarts the runtime. Lower `EVAL_TIMEOUT_MS` in
   `public/main.js` to trade patience for snappier failure.

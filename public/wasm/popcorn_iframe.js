@@ -33,6 +33,19 @@ class TrackedValue {
 globalThis.TrackedValue = TrackedValue;
 
 export async function runIFrame() {
+  try {
+    await startPopcorn();
+  } catch (error) {
+    // An iframe that dies silently is near-impossible to debug — report it.
+    send(
+      MESSAGES.STDERR,
+      `Runtime failed: ${(error && (error.stack || error.message)) || error}\n`,
+    );
+    throw error;
+  }
+}
+
+async function startPopcorn() {
   const bundlePath = document.querySelector('meta[name="bundle-path"]').content;
   binaryDir = new URL(".", bundlePath).href;
 
@@ -51,17 +64,9 @@ export async function runIFrame() {
   // This is also the step where a misconfigured mirror shows up, and an iframe
   // that dies silently is near-impossible to debug, so failures are reported to
   // the parent's output pane.
-  try {
-    const source = await fetch(binaryDir + "AtomVM.mjs").then((resp) => resp.text());
-    workerScript = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
-    ({ default: init } = await import(binaryDir + "AtomVM.mjs"));
-  } catch (error) {
-    send(
-      MESSAGES.STDERR,
-      `Runtime load failed: ${(error && (error.stack || error.message)) || error}\n`,
-    );
-    throw error;
-  }
+  const source = await fetch(binaryDir + "AtomVM.mjs").then((resp) => resp.text());
+  workerScript = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  ({ default: init } = await import(binaryDir + "AtomVM.mjs"));
 
   const bundleBuffer = await fetch(bundlePath).then((resp) =>
     resp.arrayBuffer(),

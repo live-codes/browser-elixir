@@ -20,6 +20,9 @@ import { fileURLToPath } from 'node:url';
 
 const argv = process.argv.slice(2);
 const noIsolation = argv.includes('--no-isolation');
+// `credentialless` is the other way to get a cross-origin isolated document, and
+// it does not require CORP/CORS from the runtime mirror. See README.
+const credentialless = argv.includes('--credentialless');
 const positional = argv.filter((arg) => !arg.startsWith('-'));
 
 const PORT = Number(positional[0] ?? 8125);
@@ -69,7 +72,7 @@ const server = createServer(async (req, res) => {
 
   if (!noIsolation) {
     headers['Cross-Origin-Opener-Policy'] = 'same-origin';
-    headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
+    headers['Cross-Origin-Embedder-Policy'] = credentialless ? 'credentialless' : 'require-corp';
   }
 
   res.writeHead(200, headers).end(body);

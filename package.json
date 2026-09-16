@@ -7,6 +7,7 @@
   "license": "MIT",
   "scripts": {
     "start": "node serve.js",
+    "start:credentialless": "node serve.js 8125 public --credentialless",
     "start:no-isolation": "node serve.js 8125 public --no-isolation",
     "check": "node --check serve.js && node --check public/main.js && node --check public/wasm/popcorn.js && node --check public/wasm/popcorn_iframe.js"
   }

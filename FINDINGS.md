@@ -217,12 +217,51 @@ Served the identical page with and without COOP/COEP:
 | headers | `crossOriginIsolated` | `typeof SharedArrayBuffer` | outcome |
 | --- | --- | --- | --- |
 | `COOP: same-origin` + `COEP: require-corp` | `true` | `function` | boots; run returns `220` |
+| `COOP: same-origin` + `COEP: credentialless` | `true` | `function` | boots; run returns `220` |
 | none (`--no-isolation`) | `false` | `undefined` | **`Popcorn.init()` never returns**; boot times out |
 
-Upstream's `_headers` is right, and the Emscripten build's conditional
-(`_emscripten_has_threading_support = () => !!globalThis.SharedArrayBuffer`) is not a graceful
-degradation in practice. `boot()` in `public/main.js` now names this cause explicitly, because the
-symptom is a bare timeout.
+**Mechanism.** The build is compiled with pthreads and Emscripten gates threading on the presence of
+the global:
+
+```js
+var _emscripten_has_threading_support = () => !!globalThis.SharedArrayBuffer;
+var ___pthread_create_js = (…) => { if (!_emscripten_has_threading_support()) { return 6 } … };  // 6 = EAGAIN
+```
+
+Without isolation the `SharedArrayBuffer` global is hidden, `pthread_create` returns EAGAIN, and
+AtomVM's startup — which needs a thread — never completes, so `init` resolves only on timeout.
+
+Worth correcting an earlier reading in this file: the platform does **not** refuse to *allocate* the
+shared memory outside isolation. Probed directly, `new WebAssembly.Memory({ shared: true, … })`
+still succeeds and its buffer's constructor is `SharedArrayBuffer`; only the global constructor is
+hidden. So the gate is Emscripten's check, not a hard platform block.
+
+**Consequence for mirrors.** Because the runtime is now fetched cross-origin, `require-corp` means
+the mirror has to be opt-in for embedding — jsDelivr sends `Cross-Origin-Resource-Policy:
+cross-origin` *and* `Access-Control-Allow-Origin: *`, and `raw.githubusercontent.com` sends CORS, so
+both work (verified). A mirror that sends neither would be blocked by `require-corp` but allowed
+under `credentialless`, which therefore is the safer default if the mirror is ever self-hosted.
+`serve.js` exposes both (`--credentialless`).
+
+`boot()` in `public/main.js` names this cause explicitly, because the symptom is a bare timeout.
+
+**Can the requirement be avoided?** Not with this bundle. Two routes were measured, both dead ends:
+
+| attempt | outcome |
+| --- | --- |
+| no COOP/COEP at all | **no error anywhere** — `startPopcorn()` never settles, so the VM simply never becomes ready. Emscripten's `pthread_create` returns EAGAIN and AtomVM never surfaces it, so there is nothing to catch and the only signal is the client timeout. |
+| recover `SharedArrayBuffer` at runtime | Gets *further*: the gate is satisfied and the pthread worker is really spawned — then the worker dies with `Uncaught TypeError: __emscripten_thread_crashed is not a function`. |
+
+The second is worth recording because it looks so promising: outside COI the browser still hands out
+a **real** shared `WebAssembly.Memory` (its buffer's constructor is `SharedArrayBuffer`), so
+`new WebAssembly.Memory({shared:true}).buffer.constructor` recovers the global and satisfies
+`!!globalThis.SharedArrayBuffer`. It is not enough — this build's worker path expects wiring that
+only exists in a genuine threading context — so **no runtime trick removes the requirement.**
+
+The durable fix is a build without the pthread path (AtomVM compiled single-threaded), which is a
+build-time change needing the Emscripten SDK plus the AtomVM/FissionVM source. Whether upstream
+exposes such a target has not been checked here, so treat that as the open question rather than a
+plan.
 
 ## 8. Hosting the runtime on a CDN
 
@@ -328,6 +367,7 @@ OTP 26.0.2 / Elixir 1.17.3. Provenance, the mirror pin and the hashes are in
 ```bash
 npm start                     # → http://localhost:8125/
 npm run check                 # syntax-check serve.js, public/main.js and the patched scripts
+npm run start:credentialless  # isolated via COEP: credentialless — also boots
 npm run start:no-isolation    # then reload → boot fails; proves §7
 ```
 
