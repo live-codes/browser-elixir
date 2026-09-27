@@ -20,7 +20,8 @@ npm start          # → http://localhost:8125/   (alias for: node serve.js)
 
 Pick **Elixir** or **Erlang**, pick an example (or type your own), and press **Run** — or
 `Ctrl`/`Cmd` + `Enter` in the editor. The result pane shows `inspect/1` of the last expression; the
-output pane shows `stdout` and `stderr` as the program produces them.
+output pane shows `stdout` and `stderr` as the program produces them. `?stdin=Ada%0A42` supplies
+standard input in either language, and the footer reports the run's exit code.
 
 A server is required, and it must set two cross-origin isolation headers — see
 [Limitations](#limitations). `file://` will not work, and neither will a plain static server.
@@ -48,8 +49,12 @@ hashes to verify a mirror against.
 - **Processes work.** `spawn`/`send`/`receive` and `GenServer` run on AtomVM (the runtime's own
   eval server is a GenServer).
 - **`ETS` and `:crypto` work** — `:crypto.hash(:sha256, "abc")` returns the correct digest.
-- **Self-healing.** An uncaught Elixir error aborts the VM, so the driver detects the dead instance
-  and restarts it rather than leaving the page broken.
+- **`stdin`, and an exit code.** `IO.gets` and `io:get_line` read the `?stdin=` param, in either
+  language; input that runs out returns `:eof` rather than hanging. The footer reports the run's exit
+  code — `0` on success, `1` for a runtime error, `124` for a timeout, or whatever
+  `System.halt(n)` / `erlang:halt(n)` was given.
+- **Self-healing.** A missing NIF or a compile error aborts the VM, so the driver detects the dead
+  instance and restarts it rather than leaving the page broken.
 - **No build step and no dependencies** — plain ES modules. `npm start` is the whole toolchain.
 
 ## Language support
@@ -69,11 +74,11 @@ outputs and timings in [FINDINGS.md](FINDINGS.md)):
 
 Behaviour worth knowing before you trust a snippet:
 
-- **Errors are fatal only when uncaught, and only in Elixir.** `try do … rescue e -> … end` catches
-  runtime errors. A *compile* error or a missing NIF cannot be caught — the VM aborts. **Erlang is
-  more forgiving**: `:erl_scan`/`:erl_parse` failures come back as ordinary
-  `{:error, {line, :erl_parse, [text, token]}}` values, so a missing final dot is a message, not a
-  crash.
+- **A runtime error is a value, not a restart.** Every run is wrapped, so an uncaught `raise`
+  (Elixir) or `1/0` (Erlang) comes back as a message with exit code `1` instead of killing the
+  instance. A *compile* error or a missing NIF still cannot be caught — the VM aborts. Erlang parse
+  errors were already values: `:erl_scan`/`:erl_parse` failures come back as ordinary
+  `{:error, {line, :erl_parse, [text, token]}}`, so a missing final dot is a message, not a crash.
 - **Erlang code must end with a dot** and take comma-separated expressions. Code beginning with
   `-module(` is compiled and loaded instead of evaluated, and stays callable in later runs
   (`m:double(21).`), including after switching language.
@@ -95,11 +100,14 @@ Behaviour worth knowing before you trust a snippet:
   worked around at runtime: with the headers absent the VM never becomes ready at all, and
   recovering `SharedArrayBuffer` by hand only moves the failure into the pthread worker — lifting
   the requirement means a different runtime build ([FINDINGS.md](FINDINGS.md) §7).
-- **An uncaught Elixir error costs a restart.** It is indistinguishable from a slow program, so the
-  UI waits out a 15 s timeout and then restarts the runtime. Lower `EVAL_TIMEOUT_MS` in
-  `public/main.js` to trade patience for snappier failure.
-- **No `stdin`.** AtomVM in wasm has no file descriptor 0, so `IO.gets` has nothing to read.
-  Evaluation-style snippets only.
+- **A 15 s timeout still means a dead or wedged instance.** An uncaught error is no longer the usual
+  cause, but a missing NIF, a compile error or a program that loops forever still surfaces as the
+  timeout, and the runtime is restarted. Lower `EVAL_TIMEOUT_MS` in `public/main.js` to trade
+  patience for snappier failure.
+- **`stdin` is a mock, and there is no `argv`.** The runtime has no file descriptor 0, so each run
+  installs its own IO device and serves `IO.gets` / `io:get_line` from `?stdin=`. There is no
+  filesystem, no dependency manager and no compiler driver — this is not a script runner. The device
+  lives in a module named `livecodes_io`, which a user module of the same name would replace.
 - **8.1 MB of runtime** on first load, from the mirror and cached hard afterwards; the eventual
   LiveCodes entry will need `largeDownload: true`. Only the two patched scripts (~20 KB) are
   committed — see [WASM.md](WASM.md).
@@ -115,7 +123,7 @@ Behaviour worth knowing before you trust a snippet:
 
 ```
 public/index.html     the harness page (language + example pickers, result, stdout/stderr, timings)
-public/main.js        the driver: boots Popcorn, dispatches by language, recovers a dead VM
+public/main.js        the driver: boots Popcorn, wraps runs (stdin + exit code), recovers a dead VM
 public/wasm/          the 2 patched runtime scripts — see WASM.md; everything else is mirrored
 serve.js              static server: COOP/COEP, MIME types, caching, --no-isolation
 WASM.md               where the runtime comes from, the mirror pin, and the four deviations
@@ -140,7 +148,8 @@ The demo is verified by *running* it, not by importing it — recorded outputs a
 
 Spike complete. The page boots AtomVM from a mirrored runtime, evaluates Elixir and Erlang, streams
 `stdout`/`stderr`, reports `inspect/1` of the result, survives an aborted VM, and is verified end to
-end in headless Chrome against the pinned CDN.
+end in headless Chrome against the pinned CDN. Elixir runs additionally read `stdin`, report an exit
+code and survive a runtime error ([FINDINGS.md](FINDINGS.md) §13).
 
 Next: the LiveCodes `lang-elixir` entry (`vendors.ts` URL, build-script and docs wiring) — where the
 worker/same-origin constraint from [WASM.md](WASM.md) has to be solved properly, and where cooking

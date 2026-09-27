@@ -378,3 +378,99 @@ click Run, and read `document.documentElement.dataset.status` (`booting` / `read
 PowerShell 5.1 strips embedded double quotes from native-command arguments, so `eval` scripts must
 avoid string literals entirely — the page's element ids are exposed as globals (`result`, `logs`,
 `editor`, `examples`, `run`), which is what the probes used.
+
+A cleaner way to feed those probes, found later: write the script to a file and pipe it in —
+`type probe.js | agent-browser eval --stdin` — which sidesteps shell quoting entirely. Probes that
+take longer than the CDP call timeout must be started without awaiting (fire, then read results
+back from a global), or the whole eval is discarded as `CDP command timed out`.
+
+## 13. `stdin` and exit codes, mocked in the driver
+
+Added after the spike, and measured the same way: headless Chrome, against the pinned runtime.
+
+**`IO.gets` is fatal as shipped.** The runtime's own group leader never answers `get_line`, so the
+call is never answered at all.
+
+| probe | result | time |
+| --- | --- | --- |
+| `IO.gets("")`, no device installed | **no reply** — timeout, then the instance is restarted | 15,409 ms |
+
+The fix is to answer it ourselves. The driver installs its own IO device with
+`Process.group_leader/2`, serving `get_line` from a list of lines and forwarding `put_chars` to the
+real stdout. A device built out of `StringIO` also works — both were built — but it swallows stdout
+into its own buffer, so output stops streaming; the pass-through device keeps it live and ships.
+
+| probe | result | time |
+| --- | --- | --- |
+| `IO.gets("")` against an empty device | `:eof` | 60 ms |
+| two reads, `?stdin=Ada%0A42` | `"Ada\n"` then `"42\n"` → `43` | 51 ms |
+| a third read, input exhausted | `:eof` | 58 ms |
+| `IO.puts` with the device installed | reaches the page **mid-run**: `FIRST` at 207 ms, run ended at 2,110 ms | — |
+
+**The device must be named with an atom.** `defmodule LcIo` defines `EvalInWasm.LcIo`, and `LcIo`
+resolves to it only inside the *same* eval; a later eval looks for `Elixir.LcIo`, finds nothing and
+aborts the VM (measured: a 15 s timeout and a restart). `defmodule :livecodes_io` resolves from any
+eval, and one definition per instance is enough — ~1.7 s at boot, ~50 ms per run — so it is paid in
+`boot()`. The same trap is why the wrapper must call `:livecodes_io.start/1`, not `LcIo.start/1`.
+
+The atom name also buys the thing worth having: **one device serves both languages.** It is an
+ordinary BEAM module, so Erlang reaches it as `livecodes_io:start/1` and there is no second
+implementation to keep in step. The name is reserved the hard way, and that is why it is not
+something as guessable as `lc_io`: a module of the *same* name compiled from the editor replaces the
+device, and every run after it dies on the timeout — `-module(lc_io)` against the earlier name did
+exactly that.
+
+**Erlang runs are wrapped too**, in Erlang: the dot that ends a script is stripped before the code is
+spliced into a `try`, and `catch` starts on its own line so a trailing `%` comment cannot swallow it.
+
+| probe (Erlang) | result | time |
+| --- | --- | --- |
+| `io:format("hello~n").` | stdout `hello`, exit `0` | 61 ms |
+| `io:get_line("")` twice, `?stdin=Ada%0A42` | `"Ada\n"`, `"42\n"` | 58 ms |
+| a third read, input exhausted | `eof` | 66 ms |
+| `1/0.` | exit `1`, result `{:error, :badarith}` — no restart | 51 ms |
+| `erlang:halt(3).` | exit `3` | 55 ms |
+| `lists:sum([1, 2, 3, 4]).` | `10`, exit `0` | 63 ms |
+
+**Exit codes are the driver's and the wrapper's.**
+
+| probe | exit code | note |
+| --- | --- | --- |
+| `IO.puts("hi")` | `0` | the wrapper returns the script's value |
+| `raise "boom"` | `1` | `rescue` turns it into `{:lc_error, message}` — no restart, 55 ms |
+| `System.halt(3)` / `erlang:halt(3).` | `3` | the run rewrites both to `:livecodes_io.halt/1` |
+| a program that never answers | `124` | the timeout, and the instance is restarted |
+
+`System.halt/1` cannot be supported as written. It calls `erlang:halt/1`, which is a **missing NIF**,
+so it prints a crash dump on stderr and aborts — and it **cannot be caught**, because the abort
+happens below any `try`:
+
+```
+Nif not found
+nif_not_found_error raised, printing crash dump and aborting
+… [{erlang,halt,2,…},{erlang,halt,1,…},{elixir,eval_external_handler,3,…}] …
+Aborted()
+```
+
+That abort is fast rather than slow (409 ms, surfacing as `Call cancelled due to instance deinit`),
+but it is still a dead VM. So the run rewrites `System\.halt(` and `erlang:halt(` to
+`:livecodes_io.halt/1` — which throws and *is* caught by the wrapper (`throw({:lc_exit, 3})`
+round-trips, 60 ms).
+
+Two things neither wrapper rescues, because they abort below it: a **compile error** and a
+**missing NIF**.
+
+**One abort that was never explained.** The first attempt at an Erlang device module —
+`-module(lc_io)`, four functions, a `receive` and a fun — aborted the VM with no diagnostic at all.
+It was set aside for the Elixir module above (which turned out to be the better design anyway) and
+the cause was never isolated. What the later bisect did establish is that the *same text* compiles
+now, in ~1 s, and that each construct in it is individually fine: a two-function module, a
+`spawn(fun …)` with a `receive`, `io:put_chars`, and a function named `halt/1` next to the
+auto-imported BIF all compile. So it is recorded as a single unreproduced abort rather than a
+limitation — with the caveat that Erlang compile failures abort silently, which is what makes it
+expensive to chase.
+
+Redefinition is *not* a problem in either language: `-module(m5)` defined twice in a row returns
+`:m5` both times, and the wrappers leave loaded modules usable — `m2:double(21).` → `42`, a
+two-function `m3` → `3`, and `lists:sum([1, 2, 3, 4]).` → `10`.
+

@@ -18,6 +18,10 @@ import { Popcorn } from './wasm/popcorn.js';
  *     instance is dead, and the driver restarts it rather than reusing it.
  *   - One VM serves all three actions (`eval_elixir`, `eval_erlang`,
  *     `eval_erlang_module`), so switching language needs no reboots.
+ *
+ * Elixir runs are wrapped, on top of that, so a script can read stdin from the
+ * `?stdin=` param, report an exit code, and survive a runtime error. The wrapper
+ * and the device it installs are explained where they are defined.
  */
 
 const DEFAULT_BASE_URL =
@@ -42,14 +46,166 @@ const BOOT_TIMEOUT_MESSAGE =
   'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp ' +
   '(serve.js sets both). Without them SharedArrayBuffer is unavailable and AtomVM cannot boot.';
 
+/**
+ * The stdin device, defined once per VM and shared by both languages.
+ *
+ * `IO.gets` is fatal here out of the box: the runtime's own group leader never
+ * answers `get_line`, so the call is never answered and the instance is restarted
+ * once the timeout expires. Swapping in a device that *does* answer fixes it, and
+ * this is that device — it serves `get_line` from a list of lines and forwards
+ * `put_chars` to the real stdout, so output still streams as it is produced.
+ *
+ * It is named with an atom because `defmodule LcIo` defines `EvalInWasm.LcIo`,
+ * which resolves as `LcIo` only inside the *same* eval; a later eval looks for
+ * `Elixir.LcIo`, finds nothing and aborts the VM. `:livecodes_io` resolves from
+ * any eval — and, being an ordinary BEAM module, is callable from Erlang as
+ * `livecodes_io:`. The name is effectively reserved: a module of the same name
+ * compiled from the editor silently replaces this one and breaks every run after
+ * it, which is why it is not something as guessable as `lc_io`.
+ */
+const PRELUDE = `defmodule :livecodes_io do
+  def start(stdin) do
+    lines =
+      stdin
+      |> to_string()
+      |> String.split("\\n", trim: true)
+      |> Enum.map(&(&1 <> "\\n"))
+
+    spawn(fn -> loop(lines) end)
+  end
+
+  def stop(dev), do: send(dev, :lc_stop)
+
+  def halt, do: throw({:lc_exit, 0})
+  def halt(status), do: throw({:lc_exit, status})
+
+  defp loop(lines) do
+    receive do
+      :lc_stop -> :ok
+      {:io_request, from, reply_as, req} ->
+        {reply, rest} = handle(req, lines)
+        send(from, {:io_reply, reply_as, reply})
+        loop(rest)
+    end
+  end
+
+  defp handle({:get_line, _enc, _prompt}, [line | rest]), do: {line, rest}
+  defp handle({:get_line, _enc, _prompt}, []), do: {:eof, []}
+  defp handle({:put_chars, _enc, chars}, lines) do
+    IO.write(chars)
+    {:ok, lines}
+  end
+  defp handle({:put_chars, chars}, lines) do
+    IO.write(chars)
+    {:ok, lines}
+  end
+  defp handle(other, lines), do: {{:error, {:enotsup, other}}, lines}
+end`;
+
+// The wrapper's own return value, `inspect/1`-ed — which is how a run reports
+// its exit code. Only the wrappers produce these tags, so the driver can peel
+// them back off before showing anything. Elixir prints atoms as `:lc_exit`,
+// Erlang prints the same atom as `lc_exit`, hence the optional colon.
+const EXIT_TAG = /^\{:?lc_exit, (-?\d+)\}$/;
+const ERROR_TAG = /^\{:?lc_error, ([\s\S]*)\}$/;
+
+const STDIN = new URLSearchParams(location.search).get('stdin') ?? '';
+
+/**
+ * Runs a script against the stdin device, reports a runtime error as a value
+ * instead of leaving a dead VM behind, and lets `System.halt/1` end the run.
+ *
+ * `System.halt/1` is spelled into `:livecodes_io.halt/1` because the real one calls
+ * `erlang:halt/1` — a NIF this build does not have, so it aborts the VM with a
+ * crash dump and cannot be caught by the `catch` below.
+ */
+function wrapElixir(code) {
+  const source = code.replace(/\bSystem\.halt\(/g, ':livecodes_io.halt(');
+
+  return `gl = Process.group_leader()
+dev = :livecodes_io.start(${JSON.stringify(STDIN)})
+Process.group_leader(self(), dev)
+value =
+  try do
+${source}
+  rescue
+    e -> {:lc_error, Exception.message(e)}
+  catch
+    :throw, {:lc_exit, status} -> {:lc_exit, status}
+    kind, other -> {:lc_error, inspect({kind, other})}
+  after
+    Process.group_leader(self(), gl)
+  end
+:livecodes_io.stop(dev)
+value`;
+}
+
+/**
+ * The same wrapper in Erlang. The device is the Elixir module above: it is a
+ * BEAM module with an atom name, so `livecodes_io:start/1` reaches it directly
+ * and there is no second device to keep in step.
+ *
+ * A script here is comma-separated expressions ending in a dot, so the dot is
+ * stripped before the code is spliced into the `try`, and `catch` starts on its
+ * own line so that a trailing `%` comment cannot swallow it. The variables are
+ * prefixed because erl_eval will not rebind one that is already bound.
+ */
+function wrapErlang(code) {
+  const source = code
+    .replace(/\berlang:halt\(/g, 'livecodes_io:halt(')
+    .replace(/(?<![\w.:])halt\(/g, 'livecodes_io:halt(')
+    .replace(/\.\s*$/, '');
+
+  return `LcGL = group_leader(),
+LcDev = livecodes_io:start(${erlStringLiteral(STDIN)}),
+group_leader(LcDev, self()),
+LcValue = try
+${source}
+catch throw:{lc_exit, LcStatus} -> {lc_exit, LcStatus}; LcKind:LcReason -> {lc_error, {LcKind, LcReason}} end,
+group_leader(LcGL, self()),
+livecodes_io:stop(LcDev),
+LcValue.`;
+}
+
+/**
+ * An Erlang string literal — a charlist, which `:livecodes_io.start/1` normalises
+ * with `to_string/1`. Only the escapes Erlang and JavaScript agree on are emitted.
+ */
+function erlStringLiteral(text) {
+  const escapes = { '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+  return `"${text.replace(/[\\"\n\r\t]/g, (c) => escapes[c])}"`;
+}
+
+/** `inspect/1` quotes and escapes the message; undo just enough of it. */
+function unquoteElixir(text) {
+  const quoted = /^"([\s\S]*)"$/.exec(text);
+  return (quoted ? quoted[1] : text).replace(
+    /\\(.)/g,
+    (_, c) => ({ n: '\n', t: '\t', r: '\r' })[c] ?? c,
+  );
+}
+
+/** Maps what a wrapper returned onto the result pane and an exit code. */
+function interpretTagged(data) {
+  const text = data === null || data === undefined ? '' : String(data);
+
+  const exit = EXIT_TAG.exec(text);
+  if (exit) return { exitCode: Number(exit[1]), result: '', error: false };
+
+  const failure = ERROR_TAG.exec(text);
+  if (failure) return { exitCode: 1, result: unquoteElixir(failure[1]), error: true };
+
+  return { exitCode: 0, result: text, error: false };
+}
+
 const LANGUAGES = {
   elixir: {
     label: 'Elixir',
     filename: 'main.exs',
     defaultAction: 'eval_elixir',
     note:
-      "Elixir is <em>evaluated</em>, not run as a script: the last expression's value is " +
-      'returned, so <code>IO.gets</code> has no input to read.',
+      "Elixir is <em>evaluated</em>: the last expression's value is returned. <code>IO.gets</code> " +
+      'reads the <code>?stdin=</code> param, and <code>System.halt(n)</code> sets the exit code.',
     examples: [
       {
         name: 'Hello world',
@@ -106,9 +262,23 @@ end
 `,
       },
       {
-        name: 'An uncaught error (aborts the VM)',
+        name: 'Read stdin (needs ?stdin=)',
+        code: `case IO.gets("") do
+  :eof -> IO.puts("No stdin. Add ?stdin=Ada to the URL and run again.")
+  line -> IO.puts("Hello, " <> String.trim(line) <> "!")
+end
+`,
+      },
+      {
+        name: 'Exit code via System.halt',
+        code: `IO.puts("about to exit with code 3")
+System.halt(3)
+`,
+      },
+      {
+        name: 'A runtime error (exit code 1)',
         code: `IO.puts("about to fail")
-raise "boom: this is an uncaught Elixir error"
+raise "boom: the wrapper turns this into a value"
 `,
       },
     ],
@@ -120,7 +290,9 @@ raise "boom: this is an uncaught Elixir error"
     moduleAction: 'eval_erlang_module',
     note:
       'Erlang expressions are comma-separated and must end with a dot. Code starting with ' +
-      '<code>-module(</code> is compiled and loaded, so it stays callable in later runs.',
+      '<code>-module(</code> is compiled and loaded, so it stays callable in later runs. ' +
+      '<code>io:get_line</code> reads the <code>?stdin=</code> param; <code>erlang:halt(n)</code> ' +
+      'sets the exit code.',
     examples: [
       {
         name: 'Hello world',
@@ -163,6 +335,20 @@ double(X) -> X * 2.
 `,
       },
       {
+        name: 'Read stdin (needs ?stdin=)',
+        code: `case io:get_line("") of
+  eof -> io:format("No stdin. Add ?stdin=Ada to the URL and run again.~n");
+  Line -> io:format("Hello, ~s", [Line])
+end.
+`,
+      },
+      {
+        name: 'Exit code via erlang:halt',
+        code: `io:format("about to exit with code 3~n"),
+erlang:halt(3).
+`,
+      },
+      {
         name: 'Missing the final dot (returns a parse error)',
         code: `lists:sum([1, 2, 3, 4])
 `,
@@ -193,6 +379,8 @@ const el = {
   progressText: document.getElementById('progress-text'),
   result: document.getElementById('result'),
   logs: document.getElementById('logs'),
+  exitCode: document.getElementById('exit-code'),
+  stdinNote: document.getElementById('stdin-note'),
   footerNote: document.getElementById('footer-note'),
   runtimeUrl: document.getElementById('runtime-url'),
   runtimeOverride: document.getElementById('runtime-override'),
@@ -247,6 +435,18 @@ function clearOutput() {
   el.result.replaceChildren();
   el.result.classList.remove('error');
   el.duration.textContent = '';
+  setExitCode(null);
+}
+
+function setExitCode(code) {
+  el.exitCode.textContent = `exit: ${code ?? '—'}`;
+  el.exitCode.className = `badge${code === null ? '' : code === 0 ? ' ok' : ' err'}`;
+}
+
+function showResult({ exitCode, result, error }) {
+  el.result.textContent = result;
+  el.result.classList.toggle('error', error);
+  setExitCode(exitCode);
 }
 
 function loadExample(index) {
@@ -281,6 +481,10 @@ async function boot({ announce = true } = {}) {
     onStdout: (text) => log(text, 'stdout'),
     onStderr: (text) => log(text, 'stderr'),
   });
+  // One definition per instance — every run only calls into it. It costs ~1.7 s,
+  // so it is paid here behind the boot spinner rather than on the first run.
+  await popcorn.call(['eval_elixir', PRELUDE], { timeoutMs: EVAL_TIMEOUT_MS });
+
   const bootMs = Math.round(performance.now() - started);
   document.documentElement.dataset.bootMs = String(bootMs);
   el.progress.hidden = true;
@@ -311,6 +515,12 @@ async function run() {
   const code = el.editor.value.trim();
   if (code === '') return;
 
+  const action = actionFor(code);
+  // A module definition is compiled and loaded as written; every other run is
+  // wrapped, which is what gives it a stdin device and an exit code.
+  const wrap = action === 'eval_elixir' ? wrapElixir : action === 'eval_erlang' ? wrapErlang : null;
+  const payload = wrap ? wrap(code) : code;
+
   running = true;
   el.run.disabled = true;
   clearOutput();
@@ -318,15 +528,20 @@ async function run() {
 
   const started = performance.now();
   try {
-    const { data, durationMs } = await popcorn.call([actionFor(code), code], {
+    const { data, durationMs } = await popcorn.call([action, payload], {
       timeoutMs: EVAL_TIMEOUT_MS,
     });
-    el.result.textContent = data === null || data === undefined ? '' : String(data);
+    showResult(
+      wrap
+        ? interpretTagged(data)
+        : { exitCode: 0, result: data === null || data === undefined ? '' : String(data) },
+    );
     setStatus('done', 'done', 'ok');
     el.duration.textContent = `${Math.round(durationMs)} ms`;
   } catch (error) {
-    el.result.textContent = describeError(error);
-    el.result.classList.add('error');
+    const message = describeError(error);
+    // A timeout means a program that never answered; anything else is an abort.
+    showResult({ exitCode: message === TIMEOUT_MESSAGE ? 124 : 1, result: message, error: true });
     el.duration.textContent = `${Math.round(performance.now() - started)} ms`;
     setStatus('error', 'error', 'err');
     try {
@@ -362,6 +577,10 @@ el.editor.addEventListener('keydown', (event) => {
 
 el.runtimeUrl.textContent = runtimeDir;
 el.runtimeOverride.textContent = isOverride ? '(from ?baseUrl)' : '(default)';
+el.stdinNote.textContent =
+  STDIN === ''
+    ? 'stdin: none — IO.gets returns :eof'
+    : `stdin: ${new TextEncoder().encode(STDIN).length} bytes (from ?stdin=)`;
 setLanguage('elixir');
 
 boot().catch((error) => {
