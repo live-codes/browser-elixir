@@ -1,7 +1,6 @@
 {
   "name": "@live-codes/browser-elixir",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Client-side Elixir playground: runs Elixir in the browser via Popcorn (AtomVM compiled to WebAssembly).",
   "license": "MIT",
